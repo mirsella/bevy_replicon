@@ -230,6 +230,23 @@ mod tests {
         assert_eq!(hasher1.finish(), hasher2.finish());
     }
 
+    #[test]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn hardcoded_match() {
+        let mut hasher = ProtocolHasher::default();
+
+        hasher.replicate::<StructA>(1);
+        hasher.add_server_event::<StructB>();
+        hasher.add_server_trigger::<StructC>();
+        hasher.add_client_event::<StructB>();
+        hasher.add_client_trigger::<StructC>();
+        hasher.add_custom(0);
+
+        let hash = hasher.finish();
+        dbg!(hash);
+        assert_eq!(hash, ProtocolHash(7939823631075108889));
+    }
+
     struct StructA;
     struct StructB;
     struct StructC;

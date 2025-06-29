@@ -613,7 +613,7 @@ For deserialization errors on client we use `error` level which should be visibl
 But on server we use `debug` for it to avoid flooding server logs with errors caused by clients.
 */
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 

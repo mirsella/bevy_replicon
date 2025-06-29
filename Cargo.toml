@@ -48,6 +48,7 @@ bytes = { version = "1.10", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+wasm-bindgen-test = "0.3"
 bevy = { version = "0.16.0", default-features = false, features = [
   "bevy_log",
   "bevy_sprite",
