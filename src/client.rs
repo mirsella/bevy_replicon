@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod message;
 pub mod server_mutate_ticks;
 
+use alloc::string::String;
 use bevy::prelude::*;
 use bytes::{Buf, Bytes};
 use log::{Level, debug, error, log_enabled, trace};
@@ -24,8 +25,9 @@ use crate::{
                 ctx::{BufferedSpawner, DespawnCtx, EntityBuffer, RemoveCtx, WriteCtx},
             },
             signature::SignatureMap,
+            storage::ReplicationStorage,
         },
-        server_entity_map::{EntityEntry, ServerEntityMap},
+        server_entity_map::ServerEntityMap,
     },
 };
 use confirm_history::{ConfirmHistory, EntityReplicated};
@@ -46,6 +48,7 @@ impl Plugin for ClientPlugin {
             .init_resource::<BufferedMutations>()
             .add_message::<EntityReplicated>()
             .add_message::<MutateTickReceived>()
+            .add_message::<ClientReplicationError>()
             .configure_sets(
                 PreUpdate,
                 (
@@ -213,6 +216,11 @@ fn reset(
     }
 }
 
+fn report_receive_error(world: &mut World, message: String) {
+    error!("{message}");
+    world.write_message(ClientReplicationError { message });
+}
+
 fn send_protocol_hash(mut commands: Commands, protocol: Res<ProtocolHash>) {
     debug!("sending `{:?}` to the server", *protocol);
     commands.client_trigger(*protocol);
@@ -235,7 +243,7 @@ fn apply_replication(
 ) {
     for mut message in messages.drain_received(ServerChannel::Updates) {
         if let Err(e) = apply_update_message(world, params, &mut message) {
-            error!("unable to apply update message: {e}");
+            report_receive_error(world, format!("unable to apply update message: {e}"));
 
             // SAFETY: components in the scratch were pushed using this world.
             unsafe { params.scratch.manual_drop(world.components()) };
@@ -254,7 +262,7 @@ fn apply_replication(
         let mut acks = Vec::with_capacity(MutateIndex::POSTCARD_MAX_SIZE * mutations_count);
         for message in messages.drain_received(ServerChannel::Mutations) {
             if let Err(e) = buffer_mutate_message(params, buffered_mutations, message, &mut acks) {
-                error!("unable to buffer mutate message: {e}");
+                report_receive_error(world, format!("unable to buffer mutate message: {e}"));
             }
         }
         messages.send(ClientChannel::MutationAcks, acks);
@@ -266,9 +274,12 @@ fn apply_replication(
         }
 
         if let Err(e) = apply_mutate_message(world, params, mutate) {
-            error!(
-                "unable to apply mutate message for tick `{:?}`: {e}",
-                mutate.message_tick
+            report_receive_error(
+                world,
+                format!(
+                    "unable to apply mutate message for tick `{:?}`: {e}",
+                    mutate.message_tick
+                ),
             );
 
             // SAFETY: components in the scratch were pushed using this world.
@@ -459,15 +470,29 @@ fn apply_despawn(
     // with the last replication message, but the server might not yet have received confirmation
     // from the client and could include the deletion in the this message.
     let server_entity = postcard_utils::entity_from_buf(message)?;
-    if let Some(client_entity) = params.entity_map.server_entry(server_entity).remove() {
-        // Requires manual removal since these resources are removed from the world and inaccessible to observers.
-        params.signature_map.remove(client_entity);
-        params.storage.entities.remove(&client_entity);
+    if let Some(&client_entity) = params.entity_map.to_client().get(&server_entity) {
+        let mut children = world.query::<&Children>();
+        let subtree = core::iter::once(client_entity)
+            .chain(
+                children
+                    .query(world)
+                    .iter_descendants::<Children>(client_entity),
+            )
+            .collect::<Vec<_>>();
 
         if let Ok(client_entity) = world.get_entity_mut(client_entity) {
             debug!("applying despawn for `{}`", client_entity.id());
             let ctx = DespawnCtx { message_tick };
             (params.registry.despawn)(&ctx, client_entity);
+        }
+
+        for entity in subtree {
+            if !world.entities().contains(entity) || world.get::<Remote>(entity).is_none() {
+                // Requires manual removal since these resources are removed from the world and inaccessible to observers.
+                let _ = params.entity_map.remove_by_client(entity);
+                params.signature_map.remove(entity);
+                params.storage.entities.remove(&entity);
+            }
         }
     }
 
@@ -556,30 +581,21 @@ fn apply_changes(
     // SAFETY: used only to create `DeferredEntity`, which won't let mutably alias `EntityAllocator`.
     let world = unsafe { world_cell.world_mut() };
 
-    let mut client_entity = match params.entity_map.server_entry(server_entity) {
-        EntityEntry::Occupied(entry) => {
-            let Ok(client_entity) = world.get_entity_mut(entry.get()) else {
-                // Client could predict despawn.
-                debug!("ignoring changes for despawned `{}`", entry.get());
-                message.advance(data_size);
-                return Ok(());
-            };
-
-            let mut client_entity = DeferredEntity::new(client_entity, params.scratch);
-            if !client_entity.contains::<Remote>() {
-                // Even though the entity already exists, it could have been spawned during
-                // deserialization of another component and doesn't have the marker yet.
-                client_entity.insert(Remote);
-            }
-            client_entity
-        }
-        EntityEntry::Vacant(entry) => {
-            let mut client_entity = DeferredEntity::new(world.spawn_empty(), params.scratch);
-            client_entity.insert(Remote);
-            entry.insert(client_entity.id());
-            client_entity
-        }
+    let client_entity = params
+        .entity_map
+        .get_or_insert_with(server_entity, || world.spawn_empty().id());
+    let Ok(client_entity) = world.get_entity_mut(client_entity) else {
+        // Client could predict despawn.
+        debug!("ignoring changes for despawned `{client_entity}`");
+        message.advance(data_size);
+        return Ok(());
     };
+    let mut client_entity = DeferredEntity::new(client_entity, params.scratch);
+    if !client_entity.contains::<Remote>() {
+        // Even though the entity already exists, it could have been spawned during
+        // deserialization of another component and doesn't have the marker yet.
+        client_entity.insert(Remote);
+    }
 
     params
         .entity_markers
@@ -767,36 +783,34 @@ fn apply_mutations(
         .entity_markers
         .read(params.receive_markers, &*client_entity);
 
-    let Some(mut history) = client_entity.get_mut::<ConfirmHistory>() else {
-        return Err(format!(
-            "`{}` missing history component inserted on the first update message",
-            client_entity.id()
-        )
-        .into());
-    };
+    let new_tick = if let Some(mut history) = client_entity.get_mut::<ConfirmHistory>() {
+        let new_tick = message_tick.is_newer(history.last_tick());
+        if new_tick {
+            history.set_last_tick(message_tick);
+        } else {
+            if !params.entity_markers.need_history() {
+                trace!("ignoring outdated mutations for `{}`", client_entity.id());
+                message.advance(data_size);
+                return Ok(());
+            }
 
-    let new_tick = message_tick.is_newer(history.last_tick());
-    if new_tick {
-        history.set_last_tick(message_tick);
+            let ago = history.last_tick().get().wrapping_sub(message_tick.get());
+            if ago >= u64::BITS {
+                trace!(
+                    "discarding {ago} ticks old mutations for `{}`",
+                    client_entity.id()
+                );
+                message.advance(data_size);
+                return Ok(());
+            }
+
+            history.set(ago);
+        }
+        new_tick
     } else {
-        if !params.entity_markers.need_history() {
-            trace!("ignoring outdated mutations for `{}`", client_entity.id());
-            message.advance(data_size);
-            return Ok(());
-        }
-
-        let ago = history.last_tick().get().wrapping_sub(message_tick.get());
-        if ago >= u64::BITS {
-            trace!(
-                "discarding {ago} ticks old mutations for `{}`",
-                client_entity.id()
-            );
-            message.advance(data_size);
-            return Ok(());
-        }
-
-        history.set(ago);
-    }
+        client_entity.insert(ConfirmHistory::new(message_tick));
+        true
+    };
     params.replicated.write(EntityReplicated {
         entity: client_entity.id(),
         tick: message_tick,
@@ -972,6 +986,13 @@ pub struct ClientReplicationStats {
     pub bytes: usize,
 }
 
+/// An error occurred while decoding or applying a replication message.
+#[derive(Message, Debug, Clone)]
+pub struct ClientReplicationError {
+    /// The underlying replication error.
+    pub message: String,
+}
+
 /// Marker for entities spawned by replication.
 ///
 /// Automatically inserted for each newly received entity.
@@ -994,6 +1015,240 @@ pub struct ClientReplicationStats {
 #[reflect(Component)]
 pub struct Remote;
 
+#[cfg(test)]
+mod tests {
+    use bevy::state::app::StatesPlugin;
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::{
+        postcard_utils,
+        prelude::RepliconPlugins,
+        shared::{
+            backend::channels::ServerChannel,
+            replication::registry::{
+                ReplicationRegistry, rule_fns::RuleFns, test_fns::TestFnsEntityExt,
+            },
+        },
+    };
+
+    #[derive(Component)]
+    struct DespawnIntercepted;
+
+    #[derive(Component, Debug, Deserialize, PartialEq, Serialize)]
+    struct MappedMutation(bool);
+
+    fn preserve_despawn(_ctx: &DespawnCtx, mut entity: EntityWorldMut) {
+        entity.insert(DespawnIntercepted);
+    }
+
+    fn remove_remote(_ctx: &DespawnCtx, mut entity: EntityWorldMut) {
+        entity.remove::<Remote>();
+    }
+
+    fn queue_despawn(app: &mut App, server_entity: Entity, tick: RepliconTick) {
+        let mut message = Vec::new();
+        postcard_utils::to_extend_mut(&UpdateFlags::DESPAWNS, &mut message).unwrap();
+        postcard_utils::to_extend_mut(&tick, &mut message).unwrap();
+        postcard_utils::entity_to_extend_mut(&server_entity, &mut message).unwrap();
+        app.world_mut()
+            .resource_mut::<ClientMessages>()
+            .insert_received(ServerChannel::Updates, message);
+    }
+
+    fn queue_mapping(app: &mut App, server_entity: Entity, hash: u64, tick: RepliconTick) {
+        let mut message = Vec::new();
+        postcard_utils::to_extend_mut(&UpdateFlags::MAPPINGS, &mut message).unwrap();
+        postcard_utils::to_extend_mut(&tick, &mut message).unwrap();
+        postcard_utils::entity_to_extend_mut(&server_entity, &mut message).unwrap();
+        message.extend_from_slice(&hash.to_le_bytes());
+        app.world_mut()
+            .resource_mut::<ClientMessages>()
+            .insert_received(ServerChannel::Updates, message);
+    }
+
+    fn queue_mutation(
+        app: &mut App,
+        server_entity: Entity,
+        fns_id: crate::shared::replication::registry::FnsId,
+        data: &[u8],
+        tick: RepliconTick,
+    ) {
+        let mut mutation = Vec::new();
+        postcard_utils::to_extend_mut(&fns_id, &mut mutation).unwrap();
+        mutation.extend_from_slice(data);
+
+        let mut message = Vec::new();
+        postcard_utils::to_extend_mut(&MutateFlags::MUTATIONS, &mut message).unwrap();
+        postcard_utils::to_extend_mut(&MutateIndex::default(), &mut message).unwrap();
+        postcard_utils::to_extend_mut(&tick, &mut message).unwrap();
+        postcard_utils::to_extend_mut(&tick, &mut message).unwrap();
+        postcard_utils::entity_to_extend_mut(&server_entity, &mut message).unwrap();
+        postcard_utils::to_extend_mut(&mutation.len(), &mut message).unwrap();
+        message.extend_from_slice(&mutation);
+        app.world_mut()
+            .resource_mut::<ClientMessages>()
+            .insert_received(ServerChannel::Mutations, message);
+    }
+
+    #[test]
+    fn signature_mapping_does_not_confirm_replication() {
+        let server_entity = Entity::from_raw_u32(100).unwrap();
+        let hash = 42;
+        let tick = RepliconTick::new(7);
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, StatesPlugin, RepliconPlugins));
+        app.finish();
+
+        let client_entity = app.world_mut().spawn(Signature::from_hash(hash)).id();
+        queue_mapping(&mut app, server_entity, hash, tick);
+        app.world_mut()
+            .resource_mut::<NextState<ClientState>>()
+            .set(ClientState::Connected);
+        app.update();
+
+        let world = app.world();
+        assert_eq!(
+            world
+                .resource::<ServerEntityMap>()
+                .to_client()
+                .get(&server_entity),
+            Some(&client_entity)
+        );
+        assert!(world.entity(client_entity).contains::<Remote>());
+        assert!(!world.entity(client_entity).contains::<ConfirmHistory>());
+        assert!(world.resource::<Messages<EntityReplicated>>().is_empty());
+    }
+
+    #[test]
+    fn first_same_tick_mutation_confirms_replication() {
+        let server_entity = Entity::from_raw_u32(100).unwrap();
+        let hash = 42;
+        let tick = RepliconTick::new(7);
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, StatesPlugin, RepliconPlugins));
+        let (_, fns_id) =
+            app.world_mut()
+                .resource_scope(|world, mut registry: Mut<ReplicationRegistry>| {
+                    registry.register_rule_fns(world, RuleFns::<MappedMutation>::default())
+                });
+        app.finish();
+
+        let client_entity = app.world_mut().spawn(Signature::from_hash(hash)).id();
+        let source = app.world_mut().spawn(MappedMutation(true)).id();
+        let data = app.world_mut().entity_mut(source).serialize(fns_id, tick);
+        app.world_mut().despawn(source);
+        queue_mapping(&mut app, server_entity, hash, tick);
+        queue_mutation(&mut app, server_entity, fns_id, &data, tick);
+        app.world_mut()
+            .resource_mut::<NextState<ClientState>>()
+            .set(ClientState::Connected);
+        app.update();
+
+        let world = app.world();
+        assert_eq!(
+            world.entity(client_entity).get::<MappedMutation>(),
+            Some(&MappedMutation(true))
+        );
+        let history = world.entity(client_entity).get::<ConfirmHistory>().unwrap();
+        assert_eq!(history.last_tick(), tick);
+        assert!(history.contains(tick));
+        assert!(
+            world
+                .resource::<Messages<ClientReplicationError>>()
+                .is_empty()
+        );
+
+        let mut replicated = app.world_mut().resource_mut::<Messages<EntityReplicated>>();
+        let [replicated] = replicated.drain().collect::<Vec<_>>().try_into().unwrap();
+        assert_eq!(replicated.entity, client_entity);
+        assert_eq!(replicated.tick, tick);
+    }
+
+    #[test]
+    fn custom_despawn_preserves_and_cleans_tracking() {
+        let server_root = Entity::from_raw_u32(100).unwrap();
+        let server_child = Entity::from_raw_u32(101).unwrap();
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, StatesPlugin, RepliconPlugins));
+        app.finish();
+
+        let root = app
+            .world_mut()
+            .spawn((Remote, Signature::from_hash(1)))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((Remote, Signature::from_hash(2), ChildOf(root)))
+            .id();
+        {
+            let world = app.world_mut();
+            world
+                .resource_mut::<ServerEntityMap>()
+                .insert(server_root, root);
+            world
+                .resource_mut::<ServerEntityMap>()
+                .insert(server_child, child);
+            world
+                .resource_mut::<ReplicationStorage>()
+                .insert(root, 1_u32);
+            world
+                .resource_mut::<ReplicationStorage>()
+                .insert(child, 2_u32);
+            world.resource_mut::<ReplicationRegistry>().despawn = preserve_despawn;
+        }
+
+        queue_despawn(&mut app, server_root, RepliconTick::new(1));
+        app.world_mut()
+            .resource_mut::<NextState<ClientState>>()
+            .set(ClientState::Connected);
+        app.update();
+
+        let world = app.world();
+        assert!(world.entity(root).contains::<Remote>());
+        assert!(world.entity(root).contains::<DespawnIntercepted>());
+        assert!(
+            world
+                .resource::<ReplicationStorage>()
+                .entities
+                .contains_key(&root)
+        );
+
+        app.world_mut()
+            .resource_mut::<ReplicationRegistry>()
+            .despawn = remove_remote;
+        queue_despawn(&mut app, server_root, RepliconTick::new(2));
+        app.update();
+
+        let world = app.world();
+        assert!(!world.entity(root).contains::<Remote>());
+        assert!(world.entity(child).contains::<Remote>());
+        assert!(
+            !world
+                .resource::<ServerEntityMap>()
+                .to_server()
+                .contains_key(&root)
+        );
+        assert_eq!(
+            world.resource::<ServerEntityMap>().to_server().get(&child),
+            Some(&server_child)
+        );
+        assert!(world.resource::<SignatureMap>().get(1).is_none());
+        assert_eq!(world.resource::<SignatureMap>().get(2), Some(child));
+        assert!(
+            !world
+                .resource::<ReplicationStorage>()
+                .entities
+                .contains_key(&root)
+        );
+        assert!(
+            world
+                .resource::<ReplicationStorage>()
+                .entities
+                .contains_key(&child)
+        );
+    }
+}
 /// Triggered when user-defined bytes are received in a replication message.
 ///
 /// This is emitted for data sent through [`ReplicationUserdata`](crate::server::ReplicationUserdata).

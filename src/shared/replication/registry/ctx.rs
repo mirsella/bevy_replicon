@@ -94,8 +94,7 @@ impl EntityMapper for WriteCtx<'_> {
         }
 
         self.entity_map
-            .server_entry(server_entity)
-            .or_insert_with(|| self.spawner.spawn_empty())
+            .get_or_insert_with(server_entity, || self.spawner.spawn_empty())
     }
 
     fn set_mapped(&mut self, _source: Entity, _target: Entity) {
