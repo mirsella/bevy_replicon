@@ -831,7 +831,10 @@ fn collect_changes(
                 let entity_ticks = ticks.entities.entry(entity.id());
                 let new_for_client = matches!(entity_ticks, Entry::Vacant(_));
                 let has_insertions = updates.changed_entity_added();
-                let has_removals = removal_buffer.contains_key(&entity.id());
+                let has_removals = match &entity_ticks {
+                    Entry::Occupied(entry) => entry.get().has_removals,
+                    Entry::Vacant(_) => false,
+                };
                 let starts_replication = new_for_client
                     && hidden_lifetime.is_none_or(|l| l == ScopeLifetime::AlwaysPresent);
 
@@ -891,6 +894,8 @@ fn update_ticks(
             entry.insert(EntityTicks::new(server_tick, system_tick, components))
         }
     };
+
+    entity_ticks.has_removals = false;
 
     // Advance diff cursors immediately since update messages are reliable and the client
     // applies this update message before mutations that depend on its tick.
