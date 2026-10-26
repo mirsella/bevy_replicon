@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Mighty Minions backports from upstream 0.45.0 through 0.45.4, retaining Bevy 0.19 and the 0.44.3 wire format. Archetype invalidation uses the lifecycle archetype metadata already backported in the Mighty Minions Bevy fork.
+
+### Fixed
+
+- Return an error instead of reading out of bounds in `BufFlavor` when a read crosses a segment boundary of a multi-segment `Buf`.
+- Preserve same-tick mutations when a component loses visibility, including in the entity-skip fast path.
+
+### Changed
+
+- Skip archetypes untouched by structural and visibility changes instead of falling back to a full pass when collecting changes.
+- Skip unchanged archetypes with no pending mutations when collecting changes.
+- Avoid priority lookups for hidden, unchanged, and `Once` mutations when collecting changes.
+- Skip entities that didn't change early.
+- Cache component storage per archetype.
+
 ## [0.44.3] - 2026-10-06
 
 ### Fixed

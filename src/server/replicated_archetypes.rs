@@ -2,7 +2,7 @@ use core::mem;
 
 use bevy::{
     ecs::{
-        archetype::{ArchetypeGeneration, ArchetypeId, Archetypes},
+        archetype::{Archetype, ArchetypeGeneration, ArchetypeId, Archetypes},
         component::{ComponentId, StorageType},
     },
     platform::collections::HashMap,
@@ -12,8 +12,10 @@ use log::trace;
 
 use crate::{
     prelude::*,
+    server::replication_query::{ComponentStorage, ReplicationQuery},
     shared::replication::{
         receive_markers::ReceiveMarkers,
+        registry::{ComponentIndex, ReplicationRegistry},
         rules::{ReplicationRules, component::ComponentRule},
     },
 };
@@ -88,8 +90,8 @@ impl ReplicatedArchetypes {
         self.list.get(index)
     }
 
-    pub(super) fn iter(&self) -> impl Iterator<Item = &ReplicatedArchetype> {
-        self.list.iter()
+    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut ReplicatedArchetype> {
+        self.list.iter_mut()
     }
 }
 
@@ -111,6 +113,9 @@ pub(super) struct ReplicatedArchetype {
 
     /// Components marked as replicated.
     pub(super) components: Vec<(ComponentRule, StorageType)>,
+
+    /// Keeps the normal pass active until mutations are acknowledged or no longer needed.
+    pub(super) has_pending_replication: bool,
 }
 
 impl ReplicatedArchetype {
@@ -118,12 +123,46 @@ impl ReplicatedArchetype {
         Self {
             id,
             components: Default::default(),
+            has_pending_replication: true,
         }
+    }
+
+    /// Returns an iterator over metadata for this archetype's replicated components.
+    pub(super) fn iter_components<'a, 'w>(
+        &'a self,
+        archetype: &Archetype,
+        query: &'a ReplicationQuery<'w, '_>,
+        registry: &'a ReplicationRegistry,
+    ) -> impl Iterator<Item = ComponentMetadata<'w>> + 'a {
+        debug_assert_eq!(self.id, archetype.id());
+        let table_id = archetype.table_id();
+
+        self.components.iter().map(move |&(rule, storage)| {
+            let (component_index, component_id, _) = registry.get(rule.fns_id);
+
+            // SAFETY: component and storage were obtained from this archetype.
+            let storage = unsafe { query.component_storage(table_id, storage, component_id) };
+
+            ComponentMetadata {
+                rule,
+                component_index,
+                component_id,
+                storage,
+            }
+        })
     }
 
     pub(super) fn find_rule(&self, id: ComponentId) -> Option<&ComponentRule> {
         self.components.iter().map(|(r, _)| r).find(|r| r.id == id)
     }
+}
+
+/// Replication metadata and storage for a component in an archetype.
+pub(super) struct ComponentMetadata<'w> {
+    pub(super) rule: ComponentRule,
+    pub(super) component_index: ComponentIndex,
+    pub(super) component_id: ComponentId,
+    pub(super) storage: ComponentStorage<'w>,
 }
 
 #[cfg(test)]
@@ -132,7 +171,6 @@ mod tests {
     use test_log::test;
 
     use super::*;
-    use crate::shared::replication::registry::ReplicationRegistry;
 
     #[test]
     fn empty() {
