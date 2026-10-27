@@ -61,6 +61,13 @@ use replication_query::ReplicationQuery;
 use server_tick::ServerTick;
 use visibility::client_visibility::ClientVisibility;
 
+/// Inserting or reinserting this marker sends a complete reliable snapshot to each
+/// client, including unchanged and [`ReplicationMode::Once`] components.
+///
+/// Visibility rules still apply. The marker itself does not need to be replicated.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ReplicateFullState;
+
 pub struct ServerPlugin {
     /// Schedule in which [`ServerTick`] is incremented.
     ///
@@ -166,6 +173,7 @@ impl Plugin for ServerPlugin {
             .add_observer(invalidate_scan::<Remove, (ClientTicks, ClientVisibility)>)
             // Bevy runs the `()` observers only on archetypes with a component observer, hence `Replicated`.
             .add_observer(invalidate_archetypes::<Insert, Replicated>)
+            .add_observer(invalidate_archetypes::<Insert, ReplicateFullState>)
             .add_observer(invalidate_archetypes::<Remove, Replicated>)
             .add_observer(invalidate_archetypes::<Insert, ()>)
             .add_observer(invalidate_archetypes::<Remove, ()>)
@@ -714,7 +722,7 @@ fn collect_changes(
     mut replicated_archetypes: ResMut<ReplicatedArchetypes>,
     mut serialized: ResMut<SerializedData>,
     mut removal_buffer: ResMut<RemovalBuffer>,
-    mut scan: ResMut<ReplicationScan>,
+    (mut scan, full_snapshots): (ResMut<ReplicationScan>, Query<Ref<ReplicateFullState>>),
     mut clients: Query<(
         Entity,
         &mut Updates,
@@ -762,11 +770,16 @@ fn collect_changes(
 
         let mut has_pending_replication = false;
         for entity in archetype.entities() {
+            let full_snapshot_tick = full_snapshots
+                .get(entity.id())
+                .ok()
+                .map(|marker| marker.last_changed());
             if !needs_replication(
                 entity,
                 &component_storages,
                 &filter_registry,
                 **change_tick,
+                full_snapshot_tick,
                 &clients,
             ) {
                 continue;
@@ -817,8 +830,14 @@ fn collect_changes(
                     let entity_ticks = client_ticks.entities.get(&entity.id());
                     let new_for_client = entity_ticks.is_none();
 
+                    let full_snapshot = entity_ticks.is_some_and(|ticks| {
+                        full_snapshot_tick.is_some_and(|tick| {
+                            tick.is_newer_than(ticks.system_tick, **change_tick)
+                        })
+                    });
                     if let Some(entity_ticks) = entity_ticks
                         && entity_ticks.components.contains(component_index)
+                        && !full_snapshot
                     {
                         if hidden_lifetime.is_some()
                             || rule.mode == ReplicationMode::Once
@@ -962,6 +981,7 @@ fn needs_replication(
     components: &[ComponentMetadata<'_>],
     filter_registry: &FilterRegistry,
     change_tick: Tick,
+    full_snapshot_tick: Option<Tick>,
     clients: &Query<(
         Entity,
         &mut Updates,
@@ -982,7 +1002,10 @@ fn needs_replication(
             let Some(entity_ticks) = client_ticks.entities.get(&entity.id()) else {
                 return true;
             };
-            if entity_ticks.has_removals {
+            if entity_ticks.has_removals
+                || full_snapshot_tick
+                    .is_some_and(|tick| tick.is_newer_than(entity_ticks.system_tick, change_tick))
+            {
                 return true;
             }
 
