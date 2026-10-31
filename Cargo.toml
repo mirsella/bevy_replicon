@@ -128,8 +128,16 @@ name = "diff_buffering"
 required-features = ["client", "server"]
 
 [[test]]
+name = "disabled_client"
+required-features = ["client", "server"]
+
+[[test]]
 name = "fns"
 required-features = ["client"]
+
+[[test]]
+name = "full_state"
+required-features = ["client", "server"]
 
 [[test]]
 name = "insertion"
