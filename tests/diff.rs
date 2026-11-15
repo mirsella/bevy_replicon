@@ -500,6 +500,99 @@ fn snapshot_merged_with_removal() {
 #[derive(Component, Deserialize, Serialize)]
 struct Marker;
 
+#[test]
+fn reordered_duplicate_acks_keep_distinct_diff_cursors_live() {
+    #[derive(Component, Clone, Serialize, Deserialize)]
+    struct EntityPoints(Points);
+    impl Diffable for EntityPoints {
+        type Diff = AddPoint;
+        const HISTORY_LEN: usize = Points::HISTORY_LEN;
+        fn apply_diff(&mut self, diff: &Self::Diff) -> Result<()> {
+            self.0.apply_diff(diff)
+        }
+    }
+    let mut server = App::new();
+    let mut client = App::new();
+    for app in [&mut server, &mut client] {
+        app.add_plugins((
+            MinimalPlugins,
+            StatesPlugin,
+            RepliconPlugins.set(ServerPlugin::new(PostUpdate)),
+        ))
+        .replicate_diff::<EntityPoints>()
+        .finish();
+    }
+    server.connect_client(&mut client);
+    let first = server
+        .world_mut()
+        .spawn((Replicated, EntityPoints(Points::new(vec![0]))))
+        .id();
+    let second = server
+        .world_mut()
+        .spawn((Replicated, EntityPoints(Points::new(vec![100]))))
+        .id();
+    server.update();
+    server.exchange_with_client(&mut client);
+    client.update();
+    let peer = **client.world().resource::<TestClientEntity>();
+    let mut held = Vec::new();
+    for step in 1..=2 * (Points::HISTORY_LEN + 1) {
+        server
+            .world_mut()
+            .entity_mut(first)
+            .apply_diff::<EntityPoints>(AddPoint(step))
+            .unwrap();
+        if step % 2 == 0 {
+            server
+                .world_mut()
+                .entity_mut(second)
+                .apply_diff::<EntityPoints>(AddPoint(100 + step))
+                .unwrap();
+        }
+        server.update();
+        server.exchange_with_client(&mut client);
+        client.update();
+        let acks = client
+            .world_mut()
+            .resource_mut::<ClientMessages>()
+            .drain_sent()
+            .collect::<Vec<_>>();
+        assert!(!acks.is_empty());
+        held.push(acks);
+        if step % 2 == 0 {
+            for batch in held.iter().rev() {
+                for (channel, ack) in batch {
+                    assert_eq!(*channel, usize::from(ClientChannel::MutationAcks));
+                    let mut messages = server.world_mut().resource_mut::<ServerMessages>();
+                    messages.insert_received(peer, *channel, ack.clone());
+                    messages.insert_received(peer, *channel, ack.clone());
+                }
+            }
+            held.clear();
+            server.update();
+        }
+        let mut query = client.world_mut().query::<&EntityPoints>();
+        for points in query.iter(client.world()) {
+            let points = &points.0;
+            if points.values[0] == 0 {
+                assert_eq!(points.values, (0..=step).collect::<Vec<_>>());
+                assert_eq!(
+                    points.applied_diffs, step,
+                    "ACK reordering must not force a full snapshot"
+                );
+            } else {
+                assert_eq!(
+                    points.values,
+                    std::iter::once(100)
+                        .chain((2..=step).step_by(2).map(|n| 100 + n))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(points.applied_diffs, step / 2);
+            }
+        }
+    }
+}
+
 #[derive(Resource, Deserialize, Serialize, Debug, Clone)]
 struct Points {
     values: Vec<usize>,
