@@ -164,14 +164,17 @@ impl From<ServerChannel> for usize {
 pub enum ClientChannel {
     /// For sending acks to acknowledge mutation messages received from [`ServerChannel::Mutations`].
     ///
-    /// This is an ordered reliable channel.
+    /// This is an unordered reliable channel. Each acknowledgment names an
+    /// independent mutation; the server ignores stale or duplicate indices.
+    /// Waiting for an older acknowledgment would unnecessarily delay newer
+    /// entity baselines and diff cursors.
     MutationAcks,
 }
 
 impl From<ClientChannel> for Channel {
     fn from(value: ClientChannel) -> Self {
         match value {
-            ClientChannel::MutationAcks => Channel::Ordered,
+            ClientChannel::MutationAcks => Channel::Unordered,
         }
     }
 }
