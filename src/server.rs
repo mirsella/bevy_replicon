@@ -8,7 +8,7 @@ mod replication_query;
 pub mod server_tick;
 pub mod visibility;
 
-use core::time::Duration;
+use core::{mem, time::Duration};
 
 use bevy::{
     ecs::{
@@ -783,8 +783,7 @@ fn collect_removals(
 fn collect_changes(
     (archetypes, entities): (&Archetypes, &Entities),
     query: ReplicationQuery,
-    server_tick: Res<ServerTick>,
-    change_tick: Res<ServerChangeTick>,
+    (server_tick, change_tick): (Res<ServerTick>, Res<ServerChangeTick>),
     registry: Res<ReplicationRegistry>,
     filter_registry: Res<FilterRegistry>,
     type_registry: Res<AppTypeRegistry>,
@@ -796,7 +795,8 @@ fn collect_changes(
     mut serialized: ResMut<SerializedData>,
     mut removal_buffer: ResMut<RemovalBuffer>,
     (mut scan, full_snapshots): (ResMut<ReplicationScan>, Query<Ref<ReplicateFullState>>),
-    mut clients: Query<(
+    mut clients_cache: Local<Vec<ReplicationClient<'static>>>,
+    mut clients_query: Query<(
         Entity,
         &mut Updates,
         &mut Mutations,
@@ -807,7 +807,11 @@ fn collect_changes(
 ) -> Result<()> {
     replicated_archetypes.update(archetypes, &rules, &receive_markers);
 
-    for (.., mut visibility) in &mut clients {
+    // Look up client components once per pass instead of once per entity or component.
+    let mut clients: Vec<ReplicationClient> = mem::take(&mut *clients_cache);
+    clients.extend(clients_query.iter_mut());
+
+    for (.., visibility) in &mut clients {
         for entity in visibility.changed.drain() {
             if let Ok(location) = entities.get_spawned(entity) {
                 scan.dirty.insert(location.archetype_id);
@@ -860,9 +864,28 @@ fn collect_changes(
 
             let mut entity_range = None;
             let entity_priority = query.get_priority(entity, archetype.table_id());
-            for (_, mut updates, mut mutations, ..) in &mut clients {
+            for (_, updates, mutations, client_ticks, _, visibility) in &mut clients {
                 updates.start_entity_changes();
                 mutations.start_entity();
+
+                // Insertions must bypass mutation priority to keep entity updates atomic.
+                // Detect them up front so component order can't cause mutations to be skipped.
+                if let Some(entity_ticks) = client_ticks.entities.get(&entity.id())
+                    && component_storages.iter().any(|component| {
+                        if entity_ticks.components.contains(component.component_index) {
+                            return false;
+                        }
+
+                        let hidden_lifetime = visibility
+                            .get(entity.id())
+                            .hidden_component_lifetime(&filter_registry, component.component_index);
+                        hidden_lifetime.is_none()
+                    })
+                {
+                    let entity_range =
+                        serialized.write_cached_entity(&mut entity_range, entity.id())?;
+                    updates.add_changed_entity(entity_range);
+                }
             }
 
             for &ComponentMetadata {
@@ -890,7 +913,7 @@ fn collect_changes(
                 };
 
                 let mut cached_component = None;
-                for (client, mut updates, mut mutations, client_ticks, priority_map, visibility) in
+                for (client, updates, mutations, client_ticks, priority_map, visibility) in
                     &mut clients
                 {
                     let hidden_lifetime = visibility
@@ -930,7 +953,10 @@ fn collect_changes(
                             .unwrap_or(1.0);
 
                         let tick_diff = **server_tick - entity_ticks.server_tick;
-                        if base_priority * tick_diff as f32 >= 1.0 {
+                        if updates.changed_entity_added()
+                            || entity_ticks.has_removals
+                            || base_priority * tick_diff as f32 >= 1.0
+                        {
                             trace!(
                                 "writing `{:?}` mutation for `{}` for client `{client}`",
                                 rule.fns_id,
@@ -989,7 +1015,7 @@ fn collect_changes(
                 }
             }
 
-            for (client, mut updates, mut mutations, mut ticks, _, visibility) in &mut clients {
+            for (client, updates, mutations, ticks, _, visibility) in &mut clients {
                 let hidden_lifetime = visibility
                     .get(entity.id())
                     .hidden_entity_lifetime(&filter_registry);
@@ -1015,7 +1041,7 @@ fn collect_changes(
                             "merging mutations for `{}` with updates for client `{client}`",
                             entity.id()
                         );
-                        updates.take_added_entity(&mut mutations);
+                        updates.take_added_entity(mutations);
                     }
 
                     update_ticks(
@@ -1045,8 +1071,27 @@ fn collect_changes(
     scan.dirty.clear();
     removal_buffer.clear();
 
+    // Drop the query borrows before restoring the allocation to `Local`.
+    // Vec's in-place iterator collection reuses the empty buffer across lifetimes.
+    clients.clear();
+    let old_capacity = clients.capacity();
+    let old_ptr = clients.as_ptr();
+    *clients_cache = clients.into_iter().map(|_| unreachable!()).collect();
+    debug_assert_eq!(clients_cache.capacity(), old_capacity);
+    debug_assert_eq!(clients_cache.as_ptr(), old_ptr);
+
     Ok(())
 }
+
+/// Client state borrowed for the change collection pass.
+type ReplicationClient<'w> = (
+    Entity,
+    Mut<'w, Updates>,
+    Mut<'w, Mutations>,
+    Mut<'w, ClientTicks>,
+    Mut<'w, PriorityMap>,
+    Mut<'w, ClientVisibility>,
+);
 
 /// Returns whether any client may need entity changes or tick bookkeeping.
 fn needs_replication(
@@ -1055,14 +1100,7 @@ fn needs_replication(
     filter_registry: &FilterRegistry,
     change_tick: Tick,
     full_snapshot_tick: Option<Tick>,
-    clients: &Query<(
-        Entity,
-        &mut Updates,
-        &mut Mutations,
-        &mut ClientTicks,
-        &mut PriorityMap,
-        &mut ClientVisibility,
-    )>,
+    clients: &[ReplicationClient<'_>],
 ) -> bool {
     clients
         .iter()
@@ -1345,9 +1383,10 @@ pub struct AuthorizedClient;
 /// no more often than once every 2 ticks. With the default priority of 1.0,
 /// all unacknowledged mutations will be sent every tick.
 ///
-/// All of this only affects mutations. For any component insertion or removal, the changes
-/// will be sent using [`ServerChannel::Updates`](crate::shared::backend::channels::ServerChannel::Updates).
-/// See its documentation for more details.
+/// Priority is ignored when the entity has any component insertion or removal for the client.
+/// In that case, all changes are sent together using
+/// [`ServerChannel::Updates`](crate::shared::backend::channels::ServerChannel::Updates)
+/// to keep entity updates atomic.
 #[derive(Component, Reflect, Deref, DerefMut, Default, Debug, Clone, Copy)]
 pub struct ReplicatePriority(pub f32);
 
@@ -1370,9 +1409,10 @@ pub struct ReplicatePriority(pub f32);
 /// no more often than once every 2 ticks. With the default priority of 1.0,
 /// all unacknowledged mutations will be sent every tick.
 ///
-/// All of this only affects mutations. For any component insertion or removal, the changes
-/// will be sent using [`ServerChannel::Updates`](crate::shared::backend::channels::ServerChannel::Updates).
-/// See its documentation for more details.
+/// Priority is ignored when the entity has any component insertion or removal for the client.
+/// In that case, all changes are sent together using
+/// [`ServerChannel::Updates`](crate::shared::backend::channels::ServerChannel::Updates)
+/// to keep entity updates atomic.
 #[derive(Component, Reflect, Deref, DerefMut, Default, Debug, Clone)]
 pub struct PriorityMap(EntityHashMap<f32>);
 

@@ -7,10 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Mighty Minions backports from upstream 0.45.0 through 0.45.5, retaining Bevy 0.19 and the 0.44.3 wire format. Archetype invalidation uses the lifecycle archetype metadata already backported in the Mighty Minions Bevy fork.
+Mighty Minions backports from upstream 0.45.0 through 0.45.6, retaining Bevy 0.19 and the 0.44.3 wire format. Archetype invalidation uses the lifecycle archetype metadata already backported in the Mighty Minions Bevy fork.
 
 ### Fixed
 
+- Include deprioritized mutations in reliable updates when the same entity has a component insertion or removal.
 - Send despawns and removals that happen while a client is disabled once it's enabled again, as already done for mutations.
 - Keep tick checks, acknowledgments, and cleanup of despawned unreplicated entities running for disabled clients.
 - Evaluate visibility filters for disabled entities when a client connects or its client component is inserted or removed, as already done when a filter is inserted.
@@ -22,6 +23,7 @@ Mighty Minions backports from upstream 0.45.0 through 0.45.5, retaining Bevy 0.1
 
 ### Changed
 
+- Cache client component lookups during change collection.
 - Skip archetypes untouched by structural and visibility changes instead of falling back to a full pass when collecting changes.
 - Skip unchanged archetypes with no pending mutations when collecting changes.
 - Avoid priority lookups for hidden, unchanged, and `Once` mutations when collecting changes.
