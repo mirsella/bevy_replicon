@@ -7,10 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Mighty Minions backports from upstream 0.45.0 through 0.45.6, retaining Bevy 0.19 and the 0.44.3 wire format. Archetype invalidation uses the lifecycle archetype metadata already backported in the Mighty Minions Bevy fork.
+Mighty Minions backports from upstream 0.45.0 through 0.45.7, retaining Bevy 0.19 and the 0.44.3 wire format. Archetype invalidation uses the lifecycle archetype metadata already backported in the Mighty Minions Bevy fork.
 
 ### Fixed
 
+- Ask for serde's `derive` feature directly. Postcard 1.2.0 no longer enables it, which breaks builds when no other crate enables it.
 - Include deprioritized mutations in reliable updates when the same entity has a component insertion or removal.
 - Send despawns and removals that happen while a client is disabled once it's enabled again, as already done for mutations.
 - Keep tick checks, acknowledgments, and cleanup of despawned unreplicated entities running for disabled clients.
